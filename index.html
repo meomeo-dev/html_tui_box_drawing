@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<!--
+    基于像素原理的制表符绘图（Pixel-Principled Box Drawing）
+    功能概述：
+    - 在 canvas 上以等宽字体渲染 Box Drawing 字符（U+2500–U+257F）进行网格绘图。
+    - 通过离屏画布逐个采样字符的“像素触边”来计算上下左右连通性掩码，按真实视觉像素判断连接。
+    - 绘制时根据相邻格的掩码需求自动选择最佳匹配字符（细线/粗线/双线等），保证笔画真正连贯。
+    - 支持直线/斜线辅助、橡皮擦、清空、复制为纯文本，以及种子图案初始化。
+    使用方式：打开本 HTML 文件即可交互使用，无需额外依赖。
+-->
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pixel-Principled Box Drawing | 基于像素原理的制表符绘图</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f0f2f5;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            box-sizing: border-box;
+        }
+        h1 {
+            color: #111;
+            font-weight: 600;
+        }
+        p {
+            color: #555;
+            margin-bottom: 20px;
+            max-width: 640px;
+            text-align: center;
+        }
+        canvas {
+            border: 1px solid #ccc;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            cursor: crosshair;
+            background-color: #0d1117;
+        }
+        .canvas-container {
+            position: relative;
+            line-height: 0;
+        }
+        #overlayCanvas {
+            position: absolute;
+            left: 0;
+            top: 0;
+            pointer-events: none; /* 避免阻断绘制事件 */
+            background-color: transparent; /* 覆盖通用 canvas 背景，保证透明 */
+        }
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 15px;
+            font-size: 16px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            background-color: #fff;
+            cursor: pointer;
+            transition: background-color 0.2s, border-color 0.2s;
+        }
+        button:hover {
+            background-color: #e9e9e9;
+            border-color: #bbb;
+        }
+        button.active {
+            background-color: #d0ebff;
+            border-color: #74c0fc;
+        }
+    </style>
+</head>
+<body>
+    <h1>基于像素原理的制表符绘图</h1>
+    <p>新功能：基于对 Box Drawing 字符集 (U+2500–U+257F) 的像素连接特性分析，程序现在可以从多种符合条件的字符（粗、细、双线等）中随机选择进行绘制。</p><p>该实验为了探索<strong>TUI</strong>的潜力。</p>
+    <div class="canvas-container">
+        <canvas id="drawingCanvas" width="640" height="640"></canvas>
+        <canvas id="overlayCanvas" width="640" height="640"></canvas>
+    </div>
+    <div class="controls">
+        <button id="clearButton">清空画布</button>
+        <button id="copyButton">复制文本</button>
+        <button id="eraserButton">橡皮擦</button>
+        <button id="textModeButton">文本模式：关</button>
+        <button id="guideButton">辅助线：关</button>
+        <button id="diagonalGuideButton">斜线辅助：关</button>
+        <label style="display:flex;align-items:center;gap:6px;">
+            角度
+            <input id="angleSlider" type="range" min="0" max="180" step="1" value="45" />
+            <span id="angleValue">45°</span>
+        </label>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const canvas = document.getElementById('drawingCanvas');
+            const overlayCanvas = document.getElementById('overlayCanvas');
+            const clearButton = document.getElementById('clearButton');
+            const copyButton = document.getElementById('copyButton');
+            const eraserButton = document.getElementById('eraserButton');
+            const guideButton = document.getElementById('guideButton');
+            const diagonalGuideButton = document.getElementById('diagonalGuideButton');
+            const textModeButton = document.getElementById('textModeButton');
+            const angleSlider = document.getElementById('angleSlider');
+            const angleValue = document.getElementById('angleValue');
+            const ctx = canvas.getContext('2d');
+            const octx = overlayCanvas.getContext('2d');
+
+            const CANVAS_WIDTH = canvas.width;
+            const CANVAS_HEIGHT = canvas.height;
+            const CELL_WIDTH = 8;
+            const CELL_HEIGHT = 16;
+            const FONT_SIZE = 16;
+
+            // --- 核心升级：基于像素连接分析的字符映射表 ---
+            // 这个映射表是预先分析U+2500–U+257F字符集像素连接性的结果。
+            // 键 '上下左右' (1=有连接, 0=无连接)，值是所有符合该连接模式的字符数组。
+            const CHAR_MAP = {
+                // key: 'Up Down Left Right'
+                '0000': ['·', ' '], // 孤立点
+                '0001': ['╴', '╸'], // Right only
+                '0010': ['╶', '╺'], // Left only
+                '0011': ['─', '━', '═', '┄', '┅', '┈', '┉'], // Left-Right
+                '0100': ['╷', '╹'], // Down only
+                '0101': ['┌', '┏', '┎', '┍'], // Down-Right
+                '0110': ['┐', '┓', '┑', '┒'], // Down-Left
+                '0111': ['┬', '┳', '┯', '┰', '╤', '╥'], // Down-Left-Right
+                '1000': ['╵', '╻'], // Up only
+                '1001': ['└', '┗', '┖', '┕'], // Up-Right
+                '1010': ['┘', '┛', '┚', '┙'], // Up-Left
+                '1011': ['┴', '┻', '┷', '┸', '╧', '╨'], // Up-Left-Right
+                '1100': ['│', '┃', '║', '┆', '┇', '┊', '┋'], // Up-Down
+                '1101': ['├', '┣', '┠', '┡', '┢', '╞', '╟'], // Up-Down-Right
+                '1110': ['┤', '┫', '┨', '┩', '┪', '╡', '╢'], // Up-Down-Left
+                '1111': ['┼', '╋', '╂', '╁', '┽', '╀', '┿', '╄', '╃', '╫', '╬'], // All four
+            };
+
+            // --- 基于像素的连通性判定支持 ---
+            // 使用位掩码表示边连通性：UP/DOWN/LEFT/RIGHT
+            const EDGE = { RIGHT: 1, LEFT: 2, DOWN: 4, UP: 8 };
+            const OPP = { [EDGE.UP]: EDGE.DOWN, [EDGE.DOWN]: EDGE.UP, [EDGE.LEFT]: EDGE.RIGHT, [EDGE.RIGHT]: EDGE.LEFT };
+
+            // 候选字符集合：来自原有映射表的并集，避免遗漏（运行时将按像素再分组）
+            const CANDIDATE_CHARS = (() => {
+                const set = new Set(['·', ' ']);
+                Object.values(CHAR_MAP).forEach(arr => arr.forEach(ch => set.add(ch)));
+                return Array.from(set);
+            })();
+
+            const charMaskMap = new Map(); // ch -> mask(0..15)
+            const maskToChars = {}; // mask -> char[]（按像素分析得出）
+
+            function popcount(n) { let c = 0; while (n) { n &= (n - 1); c++; } return c; }
+
+            // 在离屏画布上渲染字符并检测四边是否有“笔画像素”延伸至边缘
+            function computeCharEdgeMask(ch) {
+                const off = document.createElement('canvas');
+                off.width = CELL_WIDTH; off.height = CELL_HEIGHT;
+                const c = off.getContext('2d');
+                // 透明背景，只画白色字符，以 alpha>阈值 判断像素是否存在
+                c.clearRect(0, 0, off.width, off.height);
+                c.font = `${FONT_SIZE}px monospace`;
+                c.textAlign = 'center';
+                c.textBaseline = 'middle';
+                c.fillStyle = '#fff';
+                c.fillText(ch, off.width / 2, off.height / 2);
+
+                const { width: W, height: H } = off;
+                const data = c.getImageData(0, 0, W, H).data;
+                const alphaAt = (x, y) => data[(y * W + x) * 4 + 3];
+
+                // 在边界处采样一条 2px 宽的条带，沿着“中段”统计 alpha>阈值 的像素占比
+                const A_THRESH = 32; // 抗锯齿留白
+                const ratioOn = (x0, x1, y0, y1) => {
+                    let total = 0, on = 0;
+                    for (let y = y0; y <= y1; y++) {
+                        for (let x = x0; x <= x1; x++) {
+                            total++;
+                            if (x >= 0 && x < W && y >= 0 && y < H && alphaAt(x, y) > A_THRESH) on++;
+                        }
+                    }
+                    return total ? on / total : 0;
+                };
+
+                // 中段范围（避免角落干扰）：取 1/4..3/4 区间
+                const yMid0 = Math.floor(H * 0.25);
+                const yMid1 = Math.ceil(H * 0.75) - 1;
+                const xMid0 = Math.floor(W * 0.25);
+                const xMid1 = Math.ceil(W * 0.75) - 1;
+
+                const leftRatio = ratioOn(0, Math.min(1, W - 1), yMid0, yMid1);
+                const rightRatio = ratioOn(Math.max(0, W - 2), W - 1, yMid0, yMid1);
+                const topRatio = ratioOn(xMid0, xMid1, 0, Math.min(1, H - 1));
+                const bottomRatio = ratioOn(xMid0, xMid1, Math.max(0, H - 2), H - 1);
+
+                // 阈值：条带中有足够比例像素视为“接触边界”
+                const EDGE_THRESH = 0.20; // 20%
+                let mask = 0;
+                if (topRatio >= EDGE_THRESH) mask |= EDGE.UP;
+                if (bottomRatio >= EDGE_THRESH) mask |= EDGE.DOWN;
+                if (leftRatio >= EDGE_THRESH) mask |= EDGE.LEFT;
+                if (rightRatio >= EDGE_THRESH) mask |= EDGE.RIGHT;
+                return mask;
+            }
+
+            function precomputeCharMasks() {
+                for (const ch of CANDIDATE_CHARS) {
+                    const m = computeCharEdgeMask(ch);
+                    charMaskMap.set(ch, m);
+                    if (!maskToChars[m]) maskToChars[m] = [];
+                    // 去重：同一字符只保留一次
+                    if (!maskToChars[m].includes(ch)) maskToChars[m].push(ch);
+                }
+            }
+
+            function pickBestChar(requiredMask) {
+                // 优先精确匹配
+                if (requiredMask === 0) return '·';
+                const exact = maskToChars[requiredMask];
+                if (exact && exact.length) {
+                    return exact[Math.floor(Math.random() * exact.length)];
+                }
+                // 其次选择“超集”掩码，额外边最少
+                let best = null; let bestExtra = Infinity; let pool = [];
+                for (const [ch, m] of charMaskMap.entries()) {
+                    if ((m & requiredMask) === requiredMask && m !== 0) {
+                        const extras = popcount(m ^ requiredMask);
+                        if (extras < bestExtra) {
+                            bestExtra = extras; best = ch; pool = [ch];
+                        } else if (extras === bestExtra) {
+                            pool.push(ch);
+                        }
+                    }
+                }
+                if (pool.length) return pool[Math.floor(Math.random() * pool.length)];
+                // 再不行就返回可见点
+                return '·';
+            }
+
+            let isDrawing = false;
+            let gridState = new Map();
+            let mode = 'draw'; // 'draw' | 'erase'
+            let guideEnabled = false;
+            let dragStart = null; // { col, row }
+            let lastCell = null; // { col, row }
+            let lineLock = null; // 'h' | 'v' | null
+            let diagonalGuideEnabled = false;
+            let diagonalAngleDeg = 45;
+            let textModeEnabled = false; // 文本模式开关
+            let selectedCell = null; // 文本模式下被选中的格子 { col, row }
+
+            // 默认初始化内容（包含 box-drawing 与符号字符）
+            const DEFAULT_TEXT = `┌┒    ┌┳┒                                                                       
+┃┃ ↓  ╟╀┼┬┯┬╤╥╥┬╥┳╤┳┯┯┰╤┬╤┰┰╤┯╤╥╥┯┳┳┯┬┯┳┳╥╤┰┰╥┯┰┳╥┰╥┳┳┳╥╤┬╤┳╥╤┬┯┯┳╤┬┬┳┰┰┯┬┬┳╤═╶ 
+┊┊    ┗╨┷┸┷┴┸┸┴┴╨┷┴╧┷┷┸╧╧┴╨┷┻╨┻╨┻┴┷┴╧╧╨┸┴┻╫╄╄┼╀╁╁╁╫┸┴┻╨┷┸┷┴╧╨┻┷╨┸┻┷┷┻╧┸┸┴┸╀┽┪   
+││                                        ├┷┸┸╧┸┷┽┩                       ╟╂┨   
+││                                        ┃      ╟┨                       ├╬┪   
+┊┊    ┌┳╥━┄┉─╥━┈┅━┉┬─══┈╥━┄━┅━─═┐         ┊ Box  ┣╡                       ╟┽┪   
+┆┆ ↓  │╄╃┽╬┽┼╂╃┿╃╋╁╃╁┼╄┼┿╄┼╫╀╁╁┼┪         ┆      ┣┫      ┍╥┯┬┬┰┯╥┳┒       ┡╬┤   
+┃┃    ┢┿╀━┄═┽┨╀╀╁╀┼╃╋╀╄╄╄╄┿╫╀╫╬╫┤         │  D   ├┤      ┢╋╬╨╨┷┻╧┼╢       ╟╁┪   
+┆┆    ┊┿╡   ┠┠┈┄═━═┴─┅┄═╨┅┈┄┉┉═┉┘         ┃  r   ┠┩      ┣╋┩     ╞┨       ┣╄╡   
+║║    ┇┽┪   ╟┃                            ┇  a   ╞┤      ┡┽╡     ├┫       ┡╫╡   
+┃┃ ↓  ╞╄╋━┅┄╂┪                            ║  w   ╞┩      ┠┼┤     ┡┤       ┣╁┪   
+┇┇    ┆╋┩   ╞┊      ┏┬┳╥┳┳┬╤┰╤╤╥╤┯┬┰┯┬┳┳┳╥┫  i   ┣┨      ┢╃┩     ┣┩       ┢╂╡   
+┆┆    ├╥┽┳┳┯┬╡      ├┸┸┴┸┸╨╨┷┷┻╨┻┻╧╨╧╨┻┷┻┴┘  n   ┢┨      ╞╂╡     ╟┩       ┠╫┨   
+┋┋    ╟╧┴╨╨┻╧┪      ┋          Box Drawing   g   ╟┪      ╟┿┨     ┣┪       ┡╀┤   
+┊┊ ↓  ┢╄╫┿┽┿╄┩      ┃    ┍╥┰┉─═━═┈─┉┅┅━┅┈═┅──┅┈┄━┸┘      ┡╬┪     ┠┨       ├┼╡   
+││    └══─┉┅┄┚      ┇    ┡╃┩                             ╞╫┨     ┡┤       ╞╋┤   
+┆┆                  ┃    ┠╂┩                             ╟╁┪     ┠┪       ┣╄┩   
+║║ ↓                ┊    ╞╬┫      ┎┬╥┳┰┐                 ┢╫┨     ╟╢       ╞╂┫   
+┆┆    ┏┰╥┬┬┯╤┬┯┳╥┯┬╥╬┓   ╞┿╡      ├╁╁╄╁┪     ┍┬╥╥┯┳┳┬┬┬╥┳╃╁╃┯┬┰╤┬╁┫       ┣╬┪   
+║║    ┢┸╧╧╨┷╨┴╨┸┸┴╨┻┻┻┄┈━╄╃┤      ┢╀╀╂╫╬┑    ├╋┸╃┷╨┻┴┻┴╨┴┷┷╧╨┷╨┻┻╫╢       ┠┿┪   
+┇┇ ↓  ┃     Meo          ┡╄╡      ┖┴┻┻╧┻┛    ╞┫ ┆      Meo       ╞╢       ╞╋╡   
+┊┊    ┖────┉─┈─═┅━═┉┅─━┉─┻┷┛                 ╞╂╤┽┳╥╥┳┳┬┬┳┰┬┰┯╤╥┯┳╀┨       ├┽┫   
+┆┆                                           ┖┻┴┸╧┷┻┻╧┷┨╂┿┴┷╨┸╨╨╫╋╡       ╞╂┪   
+┃┃ ↳           →       →        →          →     ↴      ┣╢      ├╁╢       ├╋┤   
+││                                                      ┡┩      ╞╫╡       ┠╀┩   
+┊┊    ┎╥┳╤╤┰┳┬┰┳┰╥┳┳┯┬┬┯┯┬┰┰┳┬┰╥╤┯╥┬┯┳┰┰╤╤┬┯┐    ↓      ┢┩      ┣╫╢       ┡╃┤   
+││    ╟╄╀╄╫╀╬╀┼╂┿╄┼╋╫╀┿╂╬╀╬╃┼╬╄┿╄┽┼╂╂┼╫╫┼╄╬┼┨           ┡┪      ╞╬┨       ╟╫┩   
+┇┇    ┢╀╬╁╄╬╀┿┿╃╄╫┿╬╁╋┽╬╬╃┽╂╁╃┽┼╬╃╁╁╬╫╁┽┿╄┽┿╢           ╟┤      ├┿╢       ┢╬┪   
+┇┇    ┗┷╧┻┴┴╧┻┴╨┴┻┻╧╧┷┴┴┻┸┷┸┸┸┷╨┴╨┻┴╁╫╋┼╫┿╬╫╢    ↓      ┡┿┳┰╤┬╥┰╁╁┿╥╥┰╤┰┳┰╂╂┤   
+║║                                  ╟╬╋┿┼╀╋╋┪           ╟╫┷╧╧╨╨┴╀╋╫┻┸╨╧╨┻┸┿╂┤   
+┃┃                                  ┣╃╀┽╄╂┽╁┩           ┠┤      ┠╋┪       ╟┽╢   
+┋┋                                  ╞┿╁╁╄┽╫╀┩    ↓      ╞┽┯┳┰┯╥┬╫╬┽┰┰┯╥┳╤╤┿┽┫   
+││       ┎┈┉┈┈┰┅┈┅╥━═─┬┈═╥┉━┑       ╞┽╀╋╄┿┿┼┨          ╴┴╨┴┸╨╧┷┴┷╧┷┷┻┷╨┴╧┷╃╃╢   
+┊┊       ║    ║   ┇   ┃  ┃  ┃       ╞╂┼╀╂╂╫╀╡                             ├╂┪   
+││       ├┬┯┳┰╀┳╤┳╁╥╤╤╄╤╥┼┳┳┨       ╞╄┿╀╃┿┽┿┫                             ╟╄┨   
+┆┆       ┢┷╨┸┻╂┷╨╧╂╨┴┴╃╧╨╁┸╧┽╶      ╞╬╬┼╁╫╋╂┤    ↳          →         ↴   ╟╀╢   
+┇┇       │    ┆   ┆   ┊  ┊  ║       ╟┿┿╄╀┽┽╄┩                             ┣╃╢   
+├├╤┳┬╥╥┰┯┽╤╤┰╥╄┰┰┳╋╥┳┳╂┯╥╬┰┰╃┳┬┯┰╤┬╤┼┿┿╬┼╋╋╁╋┬┰┬╥┯╤┰┬┬╤┳┬┳┳╥┳┬┯┰┯┳┰┓      ┡╃╢   
+╟╟╬╋╃╫╂╃╄╋╬┽╫╁╀╬╬┼╂┿╁╫╫╄╄╄╃┽╀┼╋╀╃╃╀┼╋┿╁╋╁╁┿┽╁╬╂╀┿╬╃┿╃╁┿┼╫╃╂╋┼┿╫╋╄╋╂╡  ↓   ╟┿╢   
+┖┖┷┻┷┻┴╧┷╨╨╧┴┴┴┻┴┴┴╨╧┴┴┴┻┷╧╧┸╧┸╨┴┸╧╨╨┷┷╧┷┷╨┻╨╧┻┷┷┻┴┻╨┴╨┷╧╧┻┸┷┸┸┸┷╧┻╢      └┻┪   `;
+
+            function setupCanvas() {
+                ctx.fillStyle = '#0d1117';
+                ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+                ctx.font = `${FONT_SIZE}px monospace`;
+                ctx.fillStyle = '#56d364';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+            }
+
+            function getMousePos(event) {
+                const rect = canvas.getBoundingClientRect();
+                return {
+                    x: event.clientX - rect.left,
+                    y: event.clientY - rect.top
+                };
+            }
+
+            function redrawCell(col, row) {
+                const cellKey = `${col},${row}`;
+                if (!gridState.has(cellKey)) return;
+
+                const existingVal = gridState.get(cellKey);
+                // 锁定字符（初始化文本），保持原样绘制
+                if (existingVal && typeof existingVal === 'object' && existingVal.locked && typeof existingVal.fixedChar === 'string') {
+                    drawCharInCell(col, row, existingVal.fixedChar);
+                    return;
+                }
+
+                // 需求掩码 = 邻居存在（意图连接） OR 邻居已有边指向本格（强连接）
+                const up = gridState.get(`${col},${row - 1}`);
+                const down = gridState.get(`${col},${row + 1}`);
+                const left = gridState.get(`${col - 1},${row}`);
+                const right = gridState.get(`${col + 1},${row}`);
+                let required = 0;
+                if (up) required |= EDGE.UP;
+                if (down) required |= EDGE.DOWN;
+                if (left) required |= EDGE.LEFT;
+                if (right) required |= EDGE.RIGHT;
+                if (up && typeof up === 'object' && (up.mask & EDGE.DOWN)) required |= EDGE.UP;
+                if (down && typeof down === 'object' && (down.mask & EDGE.UP)) required |= EDGE.DOWN;
+                if (left && typeof left === 'object' && (left.mask & EDGE.RIGHT)) required |= EDGE.LEFT;
+                if (right && typeof right === 'object' && (right.mask & EDGE.LEFT)) required |= EDGE.RIGHT;
+
+                const ch = pickBestChar(required);
+                const mask = charMaskMap.get(ch) || 0;
+                gridState.set(cellKey, { ch, mask });
+
+                drawCharInCell(col, row, ch);
+            }
+
+            function drawCharInCell(col, row, ch) {
+                const drawX = col * CELL_WIDTH;
+                const drawY = row * CELL_HEIGHT;
+                ctx.fillStyle = '#0d1117';
+                ctx.fillRect(drawX, drawY, CELL_WIDTH, CELL_HEIGHT);
+                ctx.fillStyle = '#56d364';
+                const centerX = drawX + CELL_WIDTH / 2;
+                const centerY = drawY + CELL_HEIGHT / 2;
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(drawX, drawY, CELL_WIDTH, CELL_HEIGHT);
+                ctx.clip();
+                ctx.fillText(ch, centerX, centerY);
+                ctx.restore();
+            }
+
+            function inboundMask(col, row) {
+                // 计算“邻居指向本格”的边掩码（仅考虑邻居是否向内连）
+                let m = 0;
+                const up = gridState.get(`${col},${row - 1}`);
+                const down = gridState.get(`${col},${row + 1}`);
+                const left = gridState.get(`${col - 1},${row}`);
+                const right = gridState.get(`${col + 1},${row}`);
+                if (up && typeof up === 'object' && (up.mask & EDGE.DOWN)) m |= EDGE.UP;
+                if (down && typeof down === 'object' && (down.mask & EDGE.UP)) m |= EDGE.DOWN;
+                if (left && typeof left === 'object' && (left.mask & EDGE.RIGHT)) m |= EDGE.LEFT;
+                if (right && typeof right === 'object' && (right.mask & EDGE.LEFT)) m |= EDGE.RIGHT;
+                return m;
+            }
+
+            function removeIfUnconnected(col, row) {
+                const key = `${col},${row}`;
+                const v = gridState.get(key);
+                if (!v || (v.locked && typeof v.fixedChar === 'string')) return; // 保留锁定字符
+                const inbound = inboundMask(col, row);
+                if (inbound === 0) {
+                    gridState.delete(key);
+                    clearCell(col, row);
+                }
+            }
+
+            function clearCell(col, row) {
+                if (col < 0 || row < 0) return;
+                const drawX = col * CELL_WIDTH;
+                const drawY = row * CELL_HEIGHT;
+                ctx.fillStyle = '#0d1117';
+                ctx.fillRect(drawX, drawY, CELL_WIDTH, CELL_HEIGHT);
+            }
+
+            function drawCellAndNeighbors(col, row) {
+                const key = `${col},${row}`;
+                const existing = gridState.get(key);
+                // 如为空或为锁定字符位置，先占位，稍后计算出合适字符
+                if (!existing || (typeof existing === 'object' && existing.locked)) {
+                    gridState.set(key, { ch: null, mask: 0 });
+                }
+                redrawCell(col, row);
+                redrawCell(col, row - 1);
+                redrawCell(col, row + 1);
+                redrawCell(col - 1, row);
+                redrawCell(col + 1, row);
+            }
+
+            function eraseCellAndNeighbors(col, row) {
+                const key = `${col},${row}`;
+                if (!gridState.has(key)) return;
+                gridState.delete(key);
+                clearCell(col, row);
+                // 受影响邻居重算
+                redrawCell(col, row - 1);
+                redrawCell(col, row + 1);
+                redrawCell(col - 1, row);
+                redrawCell(col + 1, row);
+                // 清理空邻居背景
+                const ensureClearedIfEmpty = (c, r) => {
+                    if (!gridState.has(`${c},${r}`)) clearCell(c, r);
+                };
+                ensureClearedIfEmpty(col, row - 1);
+                ensureClearedIfEmpty(col, row + 1);
+                ensureClearedIfEmpty(col - 1, row);
+                ensureClearedIfEmpty(col + 1, row);
+                // 若邻居已无入射连接，则移除
+                removeIfUnconnected(col, row - 1);
+                removeIfUnconnected(col, row + 1);
+                removeIfUnconnected(col - 1, row);
+                removeIfUnconnected(col + 1, row);
+            }
+
+            function drawLineBetween(a, b, fnPerCell) {
+                if (!a || !b) return;
+                if (a.col === b.col) {
+                    const col = a.col;
+                    const [start, end] = a.row <= b.row ? [a.row, b.row] : [b.row, a.row];
+                    for (let r = start; r <= end; r++) fnPerCell(col, r);
+                } else if (a.row === b.row) {
+                    const row = a.row;
+                    const [start, end] = a.col <= b.col ? [a.col, b.col] : [b.col, a.col];
+                    for (let c = start; c <= end; c++) fnPerCell(c, row);
+                } else {
+                    fnPerCell(b.col, b.row);
+                }
+            }
+
+            function drawOverlayCrosshair(col, row) {
+                octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                if (!guideEnabled) return;
+                octx.save();
+                octx.strokeStyle = 'rgba(86, 211, 100, 0.25)';
+                octx.lineWidth = 1;
+                const xCenter = col * CELL_WIDTH + CELL_WIDTH / 2;
+                const yCenter = row * CELL_HEIGHT + CELL_HEIGHT / 2;
+                octx.beginPath();
+                octx.moveTo(0, yCenter + 0.5);
+                octx.lineTo(overlayCanvas.width, yCenter + 0.5);
+                octx.stroke();
+                octx.beginPath();
+                octx.moveTo(xCenter + 0.5, 0);
+                octx.lineTo(xCenter + 0.5, overlayCanvas.height);
+                octx.stroke();
+                octx.restore();
+            }
+
+            function drawOverlayEraseHighlight(col, row) {
+                octx.save();
+                octx.fillStyle = 'rgba(255, 99, 99, 0.35)';
+                octx.fillRect(col * CELL_WIDTH, row * CELL_HEIGHT, CELL_WIDTH, CELL_HEIGHT);
+                octx.restore();
+            }
+
+            function drawOverlaySelection(col, row) {
+                // 选中格高亮边框
+                const x = col * CELL_WIDTH;
+                const y = row * CELL_HEIGHT;
+                octx.save();
+                octx.strokeStyle = 'rgba(80, 170, 255, 0.9)';
+                octx.lineWidth = 1;
+                // 用 0.5 像素对齐提高清晰度
+                octx.strokeRect(Math.floor(x) + 0.5, Math.floor(y) + 0.5, CELL_WIDTH - 1, CELL_HEIGHT - 1);
+                octx.restore();
+            }
+
+            function placeCharAtCell(col, row, ch) {
+                const key = `${col},${row}`;
+                const mask = charMaskMap.has(ch) ? charMaskMap.get(ch) : computeCharEdgeMask(ch);
+                // 文本模式输入的字符视为固定字符，避免被自动替换
+                gridState.set(key, { locked: true, fixedChar: ch, mask });
+                drawCharInCell(col, row, ch);
+                // 邻居受影响需要重算以对齐该字符的边
+                redrawCell(col, row - 1);
+                redrawCell(col, row + 1);
+                redrawCell(col - 1, row);
+                redrawCell(col + 1, row);
+            }
+
+            function drawOverlayDiagonalThrough(px, py, angleDeg) {
+                // 在覆盖层上画一条穿过(px,py)且角度为 angleDeg 的无限直线，并裁剪到画布边界
+                const rad = angleDeg * Math.PI / 180;
+                const ux = Math.cos(rad), uy = Math.sin(rad);
+                const W = overlayCanvas.width, H = overlayCanvas.height;
+                const points = [];
+                const within = (x, y) => x >= -0.5 && x <= W + 0.5 && y >= -0.5 && y <= H + 0.5;
+                if (Math.abs(ux) > 1e-6) {
+                    let t = (0 - px) / ux; let y = py + t * uy; if (y >= 0 && y <= H) points.push({ x: 0, y });
+                    t = (W - px) / ux; y = py + t * uy; if (y >= 0 && y <= H) points.push({ x: W, y });
+                }
+                if (Math.abs(uy) > 1e-6) {
+                    let t = (0 - py) / uy; let x = px + t * ux; if (x >= 0 && x <= W) points.push({ x, y: 0 });
+                    t = (H - py) / uy; x = px + t * ux; if (x >= 0 && x <= W) points.push({ x, y: H });
+                }
+                // 去重并取两端点
+                const uniq = [];
+                for (const p of points) {
+                    if (!uniq.some(q => Math.hypot(q.x - p.x, q.y - p.y) < 0.5) && within(p.x, p.y)) uniq.push(p);
+                }
+                if (uniq.length < 2) return;
+                octx.save();
+                octx.strokeStyle = 'rgba(86, 211, 100, 0.35)';
+                octx.lineWidth = 1;
+                octx.beginPath();
+                octx.moveTo(uniq[0].x + 0.5, uniq[0].y + 0.5);
+                octx.lineTo(uniq[1].x + 0.5, uniq[1].y + 0.5);
+                octx.stroke();
+                octx.restore();
+            }
+
+            function clampToGrid(col, row) {
+                const cols = Math.floor(CANVAS_WIDTH / CELL_WIDTH);
+                const rows = Math.floor(CANVAS_HEIGHT / CELL_HEIGHT);
+                if (col < 0) col = 0; if (row < 0) row = 0;
+                if (col > cols - 1) col = cols - 1; if (row > rows - 1) row = rows - 1;
+                return { col, row };
+            }
+
+            function cellCenter(col, row) {
+                return {
+                    x: col * CELL_WIDTH + CELL_WIDTH / 2,
+                    y: row * CELL_HEIGHT + CELL_HEIGHT / 2
+                };
+            }
+
+            function projectToAngleLine(startCol, startRow, mx, my, angleDeg) {
+                // 将鼠标点投影到过起点的角度线，返回对应的格子坐标
+                const s = cellCenter(startCol, startRow);
+                const rad = angleDeg * Math.PI / 180;
+                const ux = Math.cos(rad), uy = Math.sin(rad);
+                const dx = mx - s.x, dy = my - s.y;
+                const t = dx * ux + dy * uy; // dot((m-s), u)
+                const px = s.x + t * ux, py = s.y + t * uy;
+                const col = Math.floor(px / CELL_WIDTH);
+                const row = Math.floor(py / CELL_HEIGHT);
+                return clampToGrid(col, row);
+            }
+
+            function drawLineBresenham(c0, r0, c1, r1, fnPerCell) {
+                let x0 = c0, y0 = r0, x1 = c1, y1 = r1;
+                const dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+                const dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+                let err = dx + dy; // error = dx - dy in some forms
+                while (true) {
+                    fnPerCell(x0, y0);
+                    if (x0 === x1 && y0 === y1) break;
+                    const e2 = 2 * err;
+                    if (e2 >= dy) { err += dy; x0 += sx; }
+                    if (e2 <= dx) { err += dx; y0 += sy; }
+                }
+            }
+
+            function handleDrawing(event) {
+                if (!isDrawing) return;
+                const { x, y } = getMousePos(event);
+                let col = Math.floor(x / CELL_WIDTH);
+                let row = Math.floor(y / CELL_HEIGHT);
+
+                if (!dragStart) {
+                    dragStart = { col, row };
+                    lastCell = { col, row };
+                }
+
+                if (diagonalGuideEnabled && dragStart) {
+                    // 斜线辅助：按角度投影到过起点的角度线
+                    const m = cellCenter(col, row); // 用格子中心更稳定
+                    const snapped = projectToAngleLine(dragStart.col, dragStart.row, m.x, m.y, diagonalAngleDeg);
+                    col = snapped.col; row = snapped.row;
+                } else if (guideEnabled) {
+                    const dcol = col - dragStart.col;
+                    const drow = row - dragStart.row;
+                    if (!lineLock) {
+                        // 只有在出现非零位移时才决定锁定方向，避免默认水平造成无法垂直绘制
+                        if (Math.abs(dcol) > Math.abs(drow) && Math.abs(dcol) >= 1) lineLock = 'h';
+                        else if (Math.abs(drow) > Math.abs(dcol) && Math.abs(drow) >= 1) lineLock = 'v';
+                        // 平手或未移动时不锁定
+                    }
+                    if (lineLock === 'h') row = dragStart.row;
+                    if (lineLock === 'v') col = dragStart.col;
+                }
+
+                const current = { col, row };
+                if (mode === 'draw') {
+                    if (diagonalGuideEnabled && lastCell) {
+                        drawLineBresenham(lastCell.col, lastCell.row, current.col, current.row, (c, r) => drawCellAndNeighbors(c, r));
+                    } else {
+                        drawLineBetween(lastCell, current, (c, r) => drawCellAndNeighbors(c, r));
+                    }
+                } else if (mode === 'erase') {
+                    if (diagonalGuideEnabled && lastCell) {
+                        drawLineBresenham(lastCell.col, lastCell.row, current.col, current.row, (c, r) => eraseCellAndNeighbors(c, r));
+                    } else {
+                        drawLineBetween(lastCell, current, (c, r) => eraseCellAndNeighbors(c, r));
+                    }
+                }
+
+                // 覆盖层渲染：斜线优先，其次十字
+                octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                if (diagonalGuideEnabled) {
+                    const anchor = dragStart ? cellCenter(dragStart.col, dragStart.row) : cellCenter(col, row);
+                    drawOverlayDiagonalThrough(anchor.x, anchor.y, diagonalAngleDeg);
+                }
+                drawOverlayCrosshair(col, row);
+                if (mode === 'erase') drawOverlayEraseHighlight(col, row);
+
+                lastCell = current;
+            }
+
+            function clearCanvas() {
+                gridState.clear();
+                setupCanvas();
+            }
+
+            // 将当前网格导出为纯文本（未填充的格子用空格表示）并复制到剪贴板
+            async function copyGridToClipboard() {
+                const cols = Math.floor(CANVAS_WIDTH / CELL_WIDTH);
+                const rows = Math.floor(CANVAS_HEIGHT / CELL_HEIGHT);
+                let lines = [];
+
+                for (let r = 0; r < rows; r++) {
+                    let line = '';
+                    for (let c = 0; c < cols; c++) {
+                        const key = `${c},${r}`;
+                        const val = gridState.get(key);
+                        let ch = ' ';
+                        if (val && typeof val === 'object') {
+                            if (typeof val.fixedChar === 'string' && val.fixedChar.length > 0) ch = val.fixedChar[0];
+                            else if (typeof val.ch === 'string' && val.ch.length > 0) ch = val.ch[0];
+                        }
+                        line += ch;
+                    }
+                    lines.push(line);
+                }
+
+                const text = lines.join('\n');
+
+                // 优先使用异步剪贴板 API，失败则回退到临时 textarea
+                const copyWithClipboardAPI = async () => {
+                    await navigator.clipboard.writeText(text);
+                };
+
+                const copyWithFallback = () => {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.setAttribute('readonly', '');
+                    ta.style.position = 'absolute';
+                    ta.style.left = '-9999px';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                };
+
+                try {
+                    if (navigator.clipboard && window.isSecureContext) {
+                        await copyWithClipboardAPI();
+                    } else {
+                        copyWithFallback();
+                    }
+                    // 轻量提示（修改按钮文本片刻）
+                    const original = copyButton.textContent;
+                    copyButton.textContent = '已复制';
+                    setTimeout(() => { copyButton.textContent = original; }, 1200);
+                } catch (e) {
+                    // 若 Clipboard API 抛错，再尝试回退
+                    try {
+                        copyWithFallback();
+                        const original = copyButton.textContent;
+                        copyButton.textContent = '已复制';
+                        setTimeout(() => { copyButton.textContent = original; }, 1200);
+                    } catch (_) {
+                        alert('复制失败，请手动选择并复制。');
+                    }
+                }
+            }
+
+            canvas.addEventListener('mousedown', (event) => {
+                const { x, y } = getMousePos(event);
+                const col = Math.floor(x / CELL_WIDTH);
+                const row = Math.floor(y / CELL_HEIGHT);
+                if (textModeEnabled) {
+                    selectedCell = { col, row };
+                    // 只画选中高亮，不进入绘制流程
+                    octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                    // 先画十字（会清屏），再画选中边框
+                    drawOverlayCrosshair(col, row);
+                    drawOverlaySelection(col, row);
+                    return;
+                }
+                isDrawing = true;
+                dragStart = null;
+                lastCell = null;
+                lineLock = null;
+                handleDrawing(event);
+            });
+            canvas.addEventListener('mousemove', (event) => {
+                if (textModeEnabled) {
+                    // 文本模式下，仅更新选中高亮和十字，不进行绘制
+                    const { x, y } = getMousePos(event);
+                    const col = Math.floor(x / CELL_WIDTH);
+                    const row = Math.floor(y / CELL_HEIGHT);
+                    octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                    // 先画十字，再画选中边框，避免被清除
+                    drawOverlayCrosshair(col, row);
+                    if (selectedCell) drawOverlaySelection(selectedCell.col, selectedCell.row);
+                    return;
+                }
+                if (isDrawing) {
+                    handleDrawing(event);
+                } else {
+                    const { x, y } = getMousePos(event);
+                    const col = Math.floor(x / CELL_WIDTH);
+                    const row = Math.floor(y / CELL_HEIGHT);
+                    octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                    if (diagonalGuideEnabled) {
+                        const center = cellCenter(col, row);
+                        drawOverlayDiagonalThrough(center.x, center.y, diagonalAngleDeg);
+                    }
+                    drawOverlayCrosshair(col, row);
+                    if (mode === 'erase') drawOverlayEraseHighlight(col, row);
+                }
+            });
+            canvas.addEventListener('mouseup', () => {
+                isDrawing = false;
+                dragStart = null;
+                lastCell = null;
+                lineLock = null;
+            });
+            canvas.addEventListener('mouseleave', () => {
+                isDrawing = false;
+                dragStart = null;
+                lastCell = null;
+                lineLock = null;
+                if (!guideEnabled) octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            });
+            clearButton.addEventListener('click', clearCanvas);
+            copyButton.addEventListener('click', copyGridToClipboard);
+            eraserButton.addEventListener('click', () => {
+                mode = mode === 'erase' ? 'draw' : 'erase';
+                eraserButton.classList.toggle('active', mode === 'erase');
+            });
+            textModeButton.addEventListener('click', () => {
+                textModeEnabled = !textModeEnabled;
+                textModeButton.textContent = `文本模式：${textModeEnabled ? '开' : '关'}`;
+                textModeButton.classList.toggle('active', textModeEnabled);
+                // 退出文本模式时清除选中高亮
+                if (!textModeEnabled) {
+                    selectedCell = null;
+                    octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                }
+            });
+            guideButton.addEventListener('click', () => {
+                guideEnabled = !guideEnabled;
+                guideButton.textContent = `辅助线：${guideEnabled ? '开' : '关'}`;
+                guideButton.classList.toggle('active', guideEnabled);
+                octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            });
+
+            diagonalGuideButton.addEventListener('click', () => {
+                diagonalGuideEnabled = !diagonalGuideEnabled;
+                diagonalGuideButton.textContent = `斜线辅助：${diagonalGuideEnabled ? '开' : '关'}`;
+                diagonalGuideButton.classList.toggle('active', diagonalGuideEnabled);
+                octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            });
+
+            angleSlider.addEventListener('input', () => {
+                diagonalAngleDeg = parseInt(angleSlider.value, 10) || 0;
+                angleValue.textContent = `${diagonalAngleDeg}°`;
+                // 即时刷新覆盖层
+                octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            });
+
+            // 文本模式键盘输入：将字符放入选中格；Backspace/Delete 清除
+            document.addEventListener('keydown', (event) => {
+                if (!textModeEnabled || !selectedCell) return;
+                // Escape 取消选中
+                if (event.key === 'Escape') {
+                    selectedCell = null;
+                    octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                    event.preventDefault();
+                    return;
+                }
+                // 删除键：清除该格
+                if (event.key === 'Backspace' || event.key === 'Delete') {
+                    eraseCellAndNeighbors(selectedCell.col, selectedCell.row);
+                    // 保持选中高亮
+                    octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                    drawOverlaySelection(selectedCell.col, selectedCell.row);
+                    event.preventDefault();
+                    return;
+                }
+                // 只处理单字符输入（排除功能键）
+                if (event.key.length === 1) {
+                    placeCharAtCell(selectedCell.col, selectedCell.row, event.key);
+                    // 重画选中高亮
+                    octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                    drawOverlaySelection(selectedCell.col, selectedCell.row);
+                    event.preventDefault();
+                }
+            });
+
+            setupCanvas();
+            // 预计算所有候选字符的边掩码（基于当前字体/像素）
+            precomputeCharMasks();
+            octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+            // 将默认文本播种到画布
+            function seedDefaultPattern() {
+                const cols = Math.floor(CANVAS_WIDTH / CELL_WIDTH);
+                const rows = Math.floor(CANVAS_HEIGHT / CELL_HEIGHT);
+                const lines = DEFAULT_TEXT.split('\n');
+                for (let r = 0; r < Math.min(rows, lines.length); r++) {
+                    const line = lines[r];
+                    for (let c = 0; c < Math.min(cols, line.length); c++) {
+                        const ch = line[c];
+                        if (ch === ' ') continue;
+                        const key = `${c},${r}`;
+                        const mask = charMaskMap.has(ch) ? charMaskMap.get(ch) : computeCharEdgeMask(ch);
+                        gridState.set(key, { locked: true, fixedChar: ch, mask });
+                        drawCharInCell(c, r, ch);
+                    }
+                }
+            }
+
+            seedDefaultPattern();
+        });
+    </script>
+</body>
+</html>

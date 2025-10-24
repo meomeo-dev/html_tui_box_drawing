@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Node / tooling (optional if you ever add tooling)
+node_modules/
+.npm/
+.pnpm-store/
+
+# Build output (if any in the future)
+dist/
+build/
+.tmp/
+.cache/
+
+# Env & logs
+.env
+*.log
+
+# Editor
+.vscode/
+.idea/
