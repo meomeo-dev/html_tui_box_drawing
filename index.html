@@ -127,6 +127,26 @@
             background-color: #d0ebff;
             border-color: #74c0fc;
         }
+        /* 轻量提示（toast） */
+        .toast {
+            position: fixed;
+            left: 50%;
+            bottom: 24px;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.8);
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 14px;
+            line-height: 1.2;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s ease-in-out;
+            z-index: 1000;
+        }
+        .toast.show {
+            opacity: 1;
+        }
     </style>
 </head>
 <body>
@@ -146,6 +166,7 @@
         <button id="copyButton">复制文本</button>
         <button id="eraserButton">橡皮擦</button>
         <button id="textModeButton">文本模式：关</button>
+        <button id="columnModeButton">列编辑模式：关</button>
         <button id="guideButton">辅助线：关</button>
         <button id="diagonalGuideButton">斜线辅助：关</button>
         <label style="display:flex;align-items:center;gap:6px;">
@@ -154,6 +175,7 @@
             <span id="angleValue">45°</span>
         </label>
     </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
     <script>
         document.addEventListener('DOMContentLoaded', () => {
@@ -169,8 +191,10 @@
             const guideButton = document.getElementById('guideButton');
             const diagonalGuideButton = document.getElementById('diagonalGuideButton');
             const textModeButton = document.getElementById('textModeButton');
+            const columnModeButton = document.getElementById('columnModeButton');
             const angleSlider = document.getElementById('angleSlider');
             const angleValue = document.getElementById('angleValue');
+            const toastEl = document.getElementById('toast');
             const ctx = canvas.getContext('2d');
             const octx = overlayCanvas.getContext('2d');
             const trctx = topRuler.getContext('2d');
@@ -320,6 +344,131 @@
             let diagonalAngleDeg = 45;
             let textModeEnabled = false; // 文本模式开关
             let selectedCell = null; // 文本模式下被选中的格子 { col, row }
+            let columnEditMode = false; // 列编辑模式：输入后向下移动
+            let toastTimer = null;
+
+            function showMessage(msg, ms = 1200) {
+                if (!toastEl) return;
+                toastEl.textContent = msg;
+                toastEl.classList.add('show');
+                if (toastTimer) clearTimeout(toastTimer);
+                toastTimer = setTimeout(() => {
+                    toastEl.classList.remove('show');
+                }, ms);
+            }
+
+            function getGridSize() {
+                return {
+                    cols: Math.floor(CANVAS_WIDTH / CELL_WIDTH),
+                    rows: Math.floor(CANVAS_HEIGHT / CELL_HEIGHT)
+                };
+            }
+
+            function refreshTextSelectionOverlay() {
+                octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                if (selectedCell) {
+                    drawOverlaySelection(selectedCell.col, selectedCell.row);
+                }
+            }
+
+            // 输入后自动移动：行模式向右，列模式向下；到边界自动换行/换列，极限处提醒
+            function moveNextAfterInput() {
+                if (!selectedCell) return;
+                const { cols, rows } = getGridSize();
+                if (!columnEditMode) {
+                    // 行模式：向右，行尾则换到下一行行首
+                    if (selectedCell.col < cols - 1) {
+                        selectedCell.col += 1;
+                    } else {
+                        if (selectedCell.row < rows - 1) {
+                            selectedCell.col = 0;
+                            selectedCell.row += 1; // 自动换行
+                        } else {
+                            showMessage('已到达边界');
+                        }
+                    }
+                } else {
+                    // 列编辑模式：向下，列尾则换到下一列列首
+                    if (selectedCell.row < rows - 1) {
+                        selectedCell.row += 1;
+                    } else {
+                        if (selectedCell.col < cols - 1) {
+                            selectedCell.row = 0;
+                            selectedCell.col += 1; // 自动换列
+                        } else {
+                            showMessage('已到达边界');
+                        }
+                    }
+                }
+                refreshTextSelectionOverlay();
+                if (selectedCell) updateCoordsUI(selectedCell.col, selectedCell.row);
+            }
+
+            // 方向键移动光标：
+            // - 行模式：Right 到行尾时自动换行；Left 到行首时若有上一行则跳到上一行末尾
+            // - 列模式：Down 到列尾时自动换列；Up 到列首时若有上一列则跳到上一列末尾
+            // 其他方向只在边界提示，不换行/换列
+            function moveCursorArrow(key) {
+                if (!selectedCell) return;
+                const { cols, rows } = getGridSize();
+                const atLastCell = selectedCell.col === cols - 1 && selectedCell.row === rows - 1;
+                if (key === 'ArrowRight') {
+                    if (!columnEditMode) {
+                        if (selectedCell.col < cols - 1) {
+                            selectedCell.col += 1;
+                        } else if (selectedCell.row < rows - 1) {
+                            selectedCell.col = 0;
+                            selectedCell.row += 1;
+                        } else {
+                            showMessage('已到达边界');
+                        }
+                    } else {
+                        // 列模式下，右键仅单步右移，不换列
+                        if (selectedCell.col < cols - 1) selectedCell.col += 1; else showMessage('已到达边界');
+                    }
+                } else if (key === 'ArrowLeft') {
+                    if (!columnEditMode) {
+                        if (selectedCell.col > 0) {
+                            selectedCell.col -= 1;
+                        } else if (selectedCell.row > 0) {
+                            selectedCell.row -= 1;
+                            selectedCell.col = cols - 1;
+                        } else {
+                            showMessage('已到达边界');
+                        }
+                    } else {
+                        if (selectedCell.col > 0) selectedCell.col -= 1; else showMessage('已到达边界');
+                    }
+                } else if (key === 'ArrowDown') {
+                    if (columnEditMode) {
+                        if (selectedCell.row < rows - 1) {
+                            selectedCell.row += 1;
+                        } else if (selectedCell.col < cols - 1) {
+                            selectedCell.row = 0;
+                            selectedCell.col += 1;
+                        } else {
+                            showMessage('已到达边界');
+                        }
+                    } else {
+                        if (selectedCell.row < rows - 1) selectedCell.row += 1; else showMessage('已到达边界');
+                    }
+                } else if (key === 'ArrowUp') {
+                    if (columnEditMode) {
+                        if (selectedCell.row > 0) {
+                            selectedCell.row -= 1;
+                        } else if (selectedCell.col > 0) {
+                            selectedCell.col -= 1;
+                            selectedCell.row = rows - 1;
+                        } else {
+                            showMessage('已到达边界');
+                        }
+                    } else {
+                        if (selectedCell.row > 0) selectedCell.row -= 1; else showMessage('已到达边界');
+                    }
+                }
+                refreshTextSelectionOverlay();
+                if (selectedCell) updateCoordsUI(selectedCell.col, selectedCell.row);
+            }
 
             // 默认初始化内容（包含 box-drawing 与符号字符）
             const DEFAULT_TEXT = `┌┒    ┌┳┒                                                                       
@@ -955,6 +1104,11 @@
                     octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
                 }
             });
+            columnModeButton.addEventListener('click', () => {
+                columnEditMode = !columnEditMode;
+                columnModeButton.textContent = `列编辑模式：${columnEditMode ? '开' : '关'}`;
+                columnModeButton.classList.toggle('active', columnEditMode);
+            });
             guideButton.addEventListener('click', () => {
                 guideEnabled = !guideEnabled;
                 guideButton.textContent = `辅助线：${guideEnabled ? '开' : '关'}`;
@@ -977,7 +1131,10 @@
                 octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
             });
 
-            // 文本模式键盘输入：将字符放入选中格；Backspace/Delete 清除
+            // 文本模式键盘输入：
+            // - 将字符放入选中格并自动移动（连续输入）
+            // - Backspace/Delete 清除
+            // - 方向键移动光标
             document.addEventListener('keydown', (event) => {
                 if (!textModeEnabled || !selectedCell) return;
                 // Escape 取消选中
@@ -991,17 +1148,21 @@
                 if (event.key === 'Backspace' || event.key === 'Delete') {
                     eraseCellAndNeighbors(selectedCell.col, selectedCell.row);
                     // 保持选中高亮
-                    octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-                    drawOverlaySelection(selectedCell.col, selectedCell.row);
+                    refreshTextSelectionOverlay();
+                    event.preventDefault();
+                    return;
+                }
+                // 方向键：移动光标
+                if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+                    moveCursorArrow(event.key);
                     event.preventDefault();
                     return;
                 }
                 // 只处理单字符输入（排除功能键）
                 if (event.key.length === 1) {
                     placeCharAtCell(selectedCell.col, selectedCell.row, event.key);
-                    // 重画选中高亮
-                    octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-                    drawOverlaySelection(selectedCell.col, selectedCell.row);
+                    // 连续输入：移动到下一格（行/列）
+                    moveNextAfterInput();
                     event.preventDefault();
                 }
             });
