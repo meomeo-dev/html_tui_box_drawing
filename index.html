@@ -174,6 +174,32 @@
             <input id="angleSlider" type="range" min="0" max="180" step="1" value="45" />
             <span id="angleValue">45°</span>
         </label>
+        <label style="display:flex;align-items:center;gap:6px;">
+            笔刷
+            <select id="brushSelect">
+                <option value="auto">自动/随机</option>
+                <option value="light">细线</option>
+                <option value="heavy">粗线</option>
+                <option value="double">双线</option>
+                <option value="dashed">虚线</option>
+                <option value="dotted">点线</option>
+                <option value="ascii">ASCII</option>
+                <optgroup label="块元素(填充/阴影/象限)">
+                    <option value="block_shading">遮蔽(░▒▓█)</option>
+                    <option value="block_h_bottom">水平-下填充(▁▂▃▄)</option>
+                    <option value="block_h_top">水平-上填充(▔▀▅▆▇)</option>
+                    <option value="block_v_left">垂直-左填充(▏▎▍▌▋▊▉)</option>
+                    <option value="block_v_right">垂直-右填充(▕▐)</option>
+                    <option value="block_half">半块(▀▄▌▐)</option>
+                    <option value="block_quadrant">象限(▖▗▘▝▙▛▜▟)</option>
+                    <option value="block_diagonal">斜线填充(▚▞)</option>
+                </optgroup>
+            </select>
+        </label>
+        <label id="brushCharLabel" style="display:none;align-items:center;gap:6px;">
+            字符
+            <select id="brushCharSelect"></select>
+        </label>
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
@@ -194,6 +220,9 @@
             const columnModeButton = document.getElementById('columnModeButton');
             const angleSlider = document.getElementById('angleSlider');
             const angleValue = document.getElementById('angleValue');
+            const brushSelect = document.getElementById('brushSelect');
+            const brushCharLabel = document.getElementById('brushCharLabel');
+            const brushCharSelect = document.getElementById('brushCharSelect');
             const toastEl = document.getElementById('toast');
             const ctx = canvas.getContext('2d');
             const octx = overlayCanvas.getContext('2d');
@@ -231,20 +260,82 @@
                 '1111': ['┼', '╋', '╂', '╁', '┽', '╀', '┿', '╄', '╃', '╫', '╬'], // All four
             };
 
+            // 笔刷：将掩码映射到特定风格字符（尽量选定风格，不再随机）。
+            // 使用按风格归类的常见字符集合，配合像素掩码做精确/近似匹配。
+            const BRUSH_STYLES = {
+                light: {
+                    // 优先细线与轻虚线/点线
+                    0: ['·', ' '],
+                    1: ['╴'],
+                    2: ['╶'],
+                    3: ['─', '┄', '┈'],
+                    4: ['╷'],
+                    5: ['┌'],
+                    6: ['┐'],
+                    7: ['┬', '┯'],
+                    8: ['╵'],
+                    9: ['└'],
+                    10: ['┘'],
+                    11: ['┴', '┷'],
+                    12: ['│', '┆', '┊'],
+                    13: ['├'],
+                    14: ['┤'],
+                    15: ['┼', '┽', '┿']
+                },
+                heavy: {
+                    0: ['·', ' '], 1: ['╸'], 2: ['╺'], 3: ['━'], 4: ['╹'], 5: ['┏'], 6: ['┓'], 7: ['┳'],
+                    8: ['╻'], 9: ['┗'], 10: ['┛'], 11: ['┻'], 12: ['┃'], 13: ['┣'], 14: ['┫'], 15: ['╋']
+                },
+                double: {
+                    0: ['·', ' '], 1: ['╸'], 2: ['╺'], 3: ['═'], 4: ['╹'], 5: ['╔','╒'], 6: ['╗','╕'], 7: ['╦','╤','╥'],
+                    8: ['╻'], 9: ['╚','╘'], 10: ['╝','╛'], 11: ['╩','╧','╨'], 12: ['║'], 13: ['╠','╞','╟'], 14: ['╣','╡','╢'], 15: ['╬','╫']
+                },
+                dashed: {
+                    0: ['·', ' '], 1: ['╴'], 2: ['╶'], 3: ['┄','┅'], 4: ['╷'], 5: ['┌'], 6: ['┐'], 7: ['┯','┰'],
+                    8: ['╵'], 9: ['└'], 10: ['┘'], 11: ['┷','┸'], 12: ['┆','┇'], 13: ['├'], 14: ['┤'], 15: ['┼','┽']
+                },
+                dotted: {
+                    0: ['·', ' '], 1: ['╴'], 2: ['╶'], 3: ['┈','┉'], 4: ['╷'], 5: ['┌'], 6: ['┐'], 7: ['┯'],
+                    8: ['╵'], 9: ['└'], 10: ['┘'], 11: ['┷'], 12: ['┊','┋'], 13: ['├'], 14: ['┤'], 15: ['┼']
+                },
+                ascii: {
+                    0: [' '], 1: ['-'], 2: ['-'], 3: ['-'], 4: ['|'], 5: ['+'], 6: ['+'], 7: ['+'], 8: ['|'], 9: ['+'], 10: ['+'], 11: ['+'], 12: ['|'], 13: ['+'], 14: ['+'], 15: ['+']
+                }
+            };
+
             // --- 基于像素的连通性判定支持 ---
             // 使用位掩码表示边连通性：UP/DOWN/LEFT/RIGHT
             const EDGE = { RIGHT: 1, LEFT: 2, DOWN: 4, UP: 8 };
             const OPP = { [EDGE.UP]: EDGE.DOWN, [EDGE.DOWN]: EDGE.UP, [EDGE.LEFT]: EDGE.RIGHT, [EDGE.RIGHT]: EDGE.LEFT };
 
             // 候选字符集合：来自原有映射表的并集，避免遗漏（运行时将按像素再分组）
+            // 块元素笔刷集合（不参与连通，固定字符）
+            const BLOCK_BRUSH_SETS = {
+                block_shading: ['░','▒','▓','█'],
+                block_h_bottom: ['▁','▂','▃','▄'],
+                block_h_top: ['▔','▀','▅','▆','▇'],
+                block_v_left: ['▏','▎','▍','▌','▋','▊','▉'],
+                block_v_right: ['▕','▐'],
+                block_half: ['▀','▄','▌','▐'],
+                block_quadrant: ['▖','▗','▘','▝','▙','▛','▜','▟'],
+                block_diagonal: ['▚','▞']
+            };
+
             const CANDIDATE_CHARS = (() => {
                 const set = new Set(['·', ' ']);
                 Object.values(CHAR_MAP).forEach(arr => arr.forEach(ch => set.add(ch)));
+                // 将笔刷风格中出现的字符也加入候选，确保预计算掩码
+                const addFromBrush = (obj) => { Object.values(obj).forEach(arr => arr.forEach(ch => set.add(ch))); };
+                Object.values(BRUSH_STYLES).forEach(style => addFromBrush(style));
+                // 加入块元素字符
+                Object.values(BLOCK_BRUSH_SETS).forEach(arr => arr.forEach(ch => set.add(ch)));
                 return Array.from(set);
             })();
 
             const charMaskMap = new Map(); // ch -> mask(0..15)
             const maskToChars = {}; // mask -> char[]（按像素分析得出）
+            let currentBrush = 'auto';
+            let currentBrushChar = null; // 二级字符选择（仅块笔刷有效）
 
             function popcount(n) { let c = 0; while (n) { n &= (n - 1); c++; } return c; }
 
@@ -309,9 +400,37 @@
                 }
             }
 
-            function pickBestChar(requiredMask) {
+            function pickBestChar(requiredMask, brushOverride = null) {
                 // 优先精确匹配
                 if (requiredMask === 0) return '·';
+                const brush = brushOverride || currentBrush;
+                // 若用户选择了固定笔刷，尝试从该笔刷中选用：先找精确掩码字符，再找最少多余边的近似字符
+                if (brush !== 'auto' && BRUSH_STYLES[brush]) {
+                    const styleMap = BRUSH_STYLES[brush];
+                    // 收集候选并计算真实掩码
+                    const candidates = [];
+                    for (const key in styleMap) {
+                        const arr = styleMap[key];
+                        for (const ch of arr) {
+                            let m;
+                            if (charMaskMap.has(ch)) m = charMaskMap.get(ch); else { m = computeCharEdgeMask(ch); charMaskMap.set(ch, m); if (!maskToChars[m]) maskToChars[m] = []; if (!maskToChars[m].includes(ch)) maskToChars[m].push(ch); }
+                            candidates.push([ch, m]);
+                        }
+                    }
+                    // 先找精确掩码
+                    const exactCand = candidates.find(([_, m]) => m === requiredMask);
+                    if (exactCand) return exactCand[0];
+                    // 再找超集，额外边最少
+                    let bestCh = null, bestExtra = Infinity;
+                    for (const [ch, m] of candidates) {
+                        if ((m & requiredMask) === requiredMask && m !== 0) {
+                            const extras = popcount(m ^ requiredMask);
+                            if (extras < bestExtra) { bestExtra = extras; bestCh = ch; }
+                        }
+                    }
+                    if (bestCh) return bestCh;
+                    // 若风格表无法满足，再回退全局集合
+                }
                 const exact = maskToChars[requiredMask];
                 if (exact && exact.length) {
                     return exact[Math.floor(Math.random() * exact.length)];
@@ -667,9 +786,28 @@
                 if (left && typeof left === 'object' && (left.mask & EDGE.RIGHT)) required |= EDGE.LEFT;
                 if (right && typeof right === 'object' && (right.mask & EDGE.LEFT)) required |= EDGE.RIGHT;
 
-                const ch = pickBestChar(required);
-                const mask = charMaskMap.get(ch) || 0;
-                gridState.set(cellKey, { ch, mask });
+                // 该格应使用其自身的笔刷（若首次生成则在占位时已赋值）
+                const brush = (existingVal && existingVal.brush) ? existingVal.brush : currentBrush;
+                let ch;
+                if (isBlockBrush(brush)) {
+                    // 块笔刷使用固定字符（来自格子或当前二级选择）
+                    ch = (existingVal && typeof existingVal.fixedChar === 'string') ? existingVal.fixedChar : (currentBrushChar || '█');
+                } else {
+                    ch = pickBestChar(required, brush);
+                }
+                // 确保该字符已有掩码，否则即时计算
+                if (!charMaskMap.has(ch)) {
+                    const m = computeCharEdgeMask(ch);
+                    charMaskMap.set(ch, m);
+                    if (!maskToChars[m]) maskToChars[m] = [];
+                    if (!maskToChars[m].includes(ch)) maskToChars[m].push(ch);
+                }
+                // ASCII 笔刷下，使用逻辑掩码；块笔刷不参与连通（使用0掩码以免误连）；否则用像素掩码
+                let mask;
+                if (brush === 'ascii') mask = required; else if (isBlockBrush(brush)) mask = 0; else mask = (charMaskMap.get(ch) || 0);
+                const payload = { ch, mask, brush };
+                if (isBlockBrush(brush)) payload.fixedChar = ch; // 不是 locked，可覆盖
+                gridState.set(cellKey, payload);
 
                 drawCharInCell(col, row, ch);
             }
@@ -726,15 +864,26 @@
             function drawCellAndNeighbors(col, row) {
                 const key = `${col},${row}`;
                 const existing = gridState.get(key);
-                // 如为空或为锁定字符位置，先占位，稍后计算出合适字符
-                if (!existing || (typeof existing === 'object' && existing.locked)) {
-                    gridState.set(key, { ch: null, mask: 0 });
+                // 仅当为空时占位并记住当前笔刷；锁定字符保持不动
+                if (!existing) {
+                    const seed = { ch: null, mask: 0, brush: currentBrush };
+                    if (isBlockBrush(currentBrush) && currentBrushChar) seed.fixedChar = currentBrushChar;
+                    gridState.set(key, seed);
+                } else if (mode === 'draw' && !existing.locked) {
+                    // 覆盖：在绘制模式下，若该格非锁定，则更新其笔刷为当前笔刷
+                    const next = { ...existing, brush: currentBrush };
+                    if (isBlockBrush(currentBrush)) next.fixedChar = currentBrushChar || existing.fixedChar; else delete next.fixedChar;
+                    gridState.set(key, next);
                 }
                 redrawCell(col, row);
                 redrawCell(col, row - 1);
                 redrawCell(col, row + 1);
                 redrawCell(col - 1, row);
                 redrawCell(col + 1, row);
+            }
+
+            function isBlockBrush(brush) {
+                return Object.prototype.hasOwnProperty.call(BLOCK_BRUSH_SETS, brush);
             }
 
             function eraseCellAndNeighbors(col, row) {
@@ -819,7 +968,7 @@
                 const key = `${col},${row}`;
                 const mask = charMaskMap.has(ch) ? charMaskMap.get(ch) : computeCharEdgeMask(ch);
                 // 文本模式输入的字符视为固定字符，避免被自动替换
-                gridState.set(key, { locked: true, fixedChar: ch, mask });
+                gridState.set(key, { locked: true, fixedChar: ch, mask, brush: 'locked' });
                 drawCharInCell(col, row, ch);
                 // 邻居受影响需要重算以对齐该字符的边
                 redrawCell(col, row - 1);
@@ -1122,6 +1271,39 @@
                 diagonalGuideButton.textContent = `斜线辅助：${diagonalGuideEnabled ? '开' : '关'}`;
                 diagonalGuideButton.classList.toggle('active', diagonalGuideEnabled);
                 octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            });
+
+            // 切换笔刷
+            brushSelect.addEventListener('change', () => {
+                currentBrush = brushSelect.value;
+                showMessage(`笔刷：${brushSelect.options[brushSelect.selectedIndex].text}`);
+                // 二级字符选择（仅块笔刷显示）
+                if (isBlockBrush(currentBrush)) {
+                    const chars = BLOCK_BRUSH_SETS[currentBrush] || [];
+                    brushCharSelect.innerHTML = '';
+                    for (const ch of chars) {
+                        const opt = document.createElement('option');
+                        opt.value = ch; opt.textContent = ch;
+                        brushCharSelect.appendChild(opt);
+                    }
+                    currentBrushChar = chars[0] || null;
+                    brushCharLabel.style.display = 'flex';
+                } else {
+                    currentBrushChar = null;
+                    brushCharLabel.style.display = 'none';
+                }
+                // 注意：不回溯修改历史像素，仅影响后续新绘制的格子。
+            });
+
+            // 切换块笔刷具体字符
+            brushCharSelect.addEventListener('change', () => {
+                currentBrushChar = brushCharSelect.value || null;
+                if (currentBrushChar && !charMaskMap.has(currentBrushChar)) {
+                    const m = computeCharEdgeMask(currentBrushChar);
+                    charMaskMap.set(currentBrushChar, m);
+                    if (!maskToChars[m]) maskToChars[m] = [];
+                    if (!maskToChars[m].includes(currentBrushChar)) maskToChars[m].push(currentBrushChar);
+                }
             });
 
             angleSlider.addEventListener('input', () => {
