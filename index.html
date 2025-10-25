@@ -54,6 +54,57 @@
             pointer-events: none; /* 避免阻断绘制事件 */
             background-color: transparent; /* 覆盖通用 canvas 背景，保证透明 */
         }
+        /* 画布 + 刻度尺布局 */
+        .stage {
+            display: grid;
+            grid-template-columns: var(--ruler-left, 40px) auto;
+            grid-template-rows: var(--ruler-top, 24px) auto;
+            gap: 0;
+            align-items: start;
+            justify-items: start;
+        }
+        .corner-box {
+            grid-column: 1 / 2; /* 左上角 */
+            grid-row: 1 / 2;
+            background: #161b22;
+            color: #9aa4b2;
+            font-size: 12px;
+            min-width: 40px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid #2b3137;
+            box-sizing: border-box;
+            border-right: none;
+            border-bottom: none;
+            border-radius: 6px 0 0 0;
+        }
+        #topRuler {
+            grid-column: 2 / 3;
+            grid-row: 1 / 2;
+            background: #161b22;
+            border: 1px solid #2b3137;
+            border-left: none;
+            border-radius: 0 6px 0 0;
+            box-shadow: none;
+            cursor: default;
+        }
+        #leftRuler {
+            grid-column: 1 / 2;
+            grid-row: 2 / 3;
+            background: #161b22;
+            border: 1px solid #2b3137;
+            border-top: none;
+            border-radius: 0 0 0 6px;
+            box-shadow: none;
+            cursor: default;
+        }
+        .stage .canvas-container {
+            grid-column: 2 / 3;
+            grid-row: 2 / 3;
+        }
+        .hidden { display: none !important; }
         .controls {
             margin-top: 20px;
             display: flex;
@@ -81,9 +132,14 @@
 <body>
     <h1>基于像素原理的制表符绘图</h1>
     <p>新功能：基于对 Box Drawing 字符集 (U+2500–U+257F) 的像素连接特性分析，程序现在可以从多种符合条件的字符（粗、细、双线等）中随机选择进行绘制。</p><p>该实验为了探索<strong>TUI</strong>的潜力。</p>
-    <div class="canvas-container">
-        <canvas id="drawingCanvas" width="640" height="640"></canvas>
-        <canvas id="overlayCanvas" width="640" height="640"></canvas>
+    <div class="stage" id="stage">
+    <div class="corner-box hidden" id="cornerBox">1,1</div>
+        <canvas id="topRuler" class="hidden" width="640" height="24"></canvas>
+        <canvas id="leftRuler" class="hidden" width="40" height="640"></canvas>
+        <div class="canvas-container">
+            <canvas id="drawingCanvas" width="640" height="640"></canvas>
+            <canvas id="overlayCanvas" width="640" height="640"></canvas>
+        </div>
     </div>
     <div class="controls">
         <button id="clearButton">清空画布</button>
@@ -103,6 +159,10 @@
         document.addEventListener('DOMContentLoaded', () => {
             const canvas = document.getElementById('drawingCanvas');
             const overlayCanvas = document.getElementById('overlayCanvas');
+            const topRuler = document.getElementById('topRuler');
+            const leftRuler = document.getElementById('leftRuler');
+            const cornerBox = document.getElementById('cornerBox');
+            const stage = document.getElementById('stage');
             const clearButton = document.getElementById('clearButton');
             const copyButton = document.getElementById('copyButton');
             const eraserButton = document.getElementById('eraserButton');
@@ -113,12 +173,16 @@
             const angleValue = document.getElementById('angleValue');
             const ctx = canvas.getContext('2d');
             const octx = overlayCanvas.getContext('2d');
+            const trctx = topRuler.getContext('2d');
+            const lrctx = leftRuler.getContext('2d');
 
             const CANVAS_WIDTH = canvas.width;
             const CANVAS_HEIGHT = canvas.height;
             const CELL_WIDTH = 8;
             const CELL_HEIGHT = 16;
             const FONT_SIZE = 16;
+            const RULER_TOP = 24;   // 顶部刻度尺高度
+            const RULER_LEFT = 40;  // 左侧刻度尺宽度
 
             // --- 核心升级：基于像素连接分析的字符映射表 ---
             // 这个映射表是预先分析U+2500–U+257F字符集像素连接性的结果。
@@ -308,12 +372,124 @@
                 ctx.textBaseline = 'middle';
             }
 
+            function setupRulers() {
+                // 依据画布尺寸调整布局列行尺寸
+                stage.style.setProperty('--ruler-left', `${RULER_LEFT}px`);
+                stage.style.setProperty('--ruler-top', `${RULER_TOP}px`);
+                // 同步像素尺寸
+                topRuler.width = CANVAS_WIDTH; topRuler.height = RULER_TOP;
+                leftRuler.width = RULER_LEFT; leftRuler.height = CANVAS_HEIGHT;
+                drawRulers();
+            }
+
+            function drawTopRuler(highlightCol = null) {
+                const W = topRuler.width, H = topRuler.height;
+                trctx.clearRect(0, 0, W, H);
+                // 背景
+                trctx.fillStyle = '#161b22';
+                trctx.fillRect(0, 0, W, H);
+                // 下边线
+                trctx.strokeStyle = '#2b3137';
+                trctx.lineWidth = 1;
+                trctx.beginPath();
+                trctx.moveTo(0, H - 0.5);
+                trctx.lineTo(W, H - 0.5);
+                trctx.stroke();
+                // 刻度
+                const cols = Math.floor(CANVAS_WIDTH / CELL_WIDTH);
+                for (let c = 0; c <= cols; c++) {
+                    const x = Math.round(c * CELL_WIDTH) + 0.5;
+                    let tick = 6; // 小刻度
+                    if (c % 8 === 0) tick = 12; else if (c % 4 === 0) tick = 9;
+                    trctx.strokeStyle = 'rgba(200, 200, 200, 0.5)';
+                    trctx.beginPath();
+                    trctx.moveTo(x, H);
+                    trctx.lineTo(x, H - tick);
+                    trctx.stroke();
+                    if (c % 8 === 0 && c < cols) {
+                        trctx.fillStyle = '#a8b3bd';
+                        trctx.font = '10px monospace';
+                        trctx.textAlign = 'left';
+                        trctx.textBaseline = 'alphabetic';
+                        trctx.fillText(`${c}`, x + 2, H - tick - 2);
+                    }
+                }
+                if (Number.isInteger(highlightCol) && highlightCol >= 0) {
+                    const x0 = highlightCol * CELL_WIDTH;
+                    trctx.fillStyle = 'rgba(86, 211, 100, 0.12)';
+                    trctx.fillRect(x0, 0, CELL_WIDTH, H);
+                }
+            }
+
+            function drawLeftRuler(highlightRow = null) {
+                const W = leftRuler.width, H = leftRuler.height;
+                lrctx.clearRect(0, 0, W, H);
+                // 背景
+                lrctx.fillStyle = '#161b22';
+                lrctx.fillRect(0, 0, W, H);
+                // 右边线
+                lrctx.strokeStyle = '#2b3137';
+                lrctx.lineWidth = 1;
+                lrctx.beginPath();
+                lrctx.moveTo(W - 0.5, 0);
+                lrctx.lineTo(W - 0.5, H);
+                lrctx.stroke();
+                // 刻度
+                const rows = Math.floor(CANVAS_HEIGHT / CELL_HEIGHT);
+                for (let r = 0; r <= rows; r++) {
+                    const y = Math.round(r * CELL_HEIGHT) + 0.5;
+                    let tick = 6;
+                    if (r % 8 === 0) tick = 12; else if (r % 4 === 0) tick = 9;
+                    lrctx.strokeStyle = 'rgba(200, 200, 200, 0.5)';
+                    lrctx.beginPath();
+                    lrctx.moveTo(W, y);
+                    lrctx.lineTo(W - tick, y);
+                    lrctx.stroke();
+                    if (r % 8 === 0 && r < rows) {
+                        lrctx.fillStyle = '#a8b3bd';
+                        lrctx.font = '10px monospace';
+                        lrctx.textAlign = 'right';
+                        lrctx.textBaseline = 'middle';
+                        lrctx.fillText(`${r}`, W - tick - 3, y);
+                    }
+                }
+                if (Number.isInteger(highlightRow) && highlightRow >= 0) {
+                    const y0 = highlightRow * CELL_HEIGHT;
+                    lrctx.fillStyle = 'rgba(86, 211, 100, 0.12)';
+                    lrctx.fillRect(0, y0, W, CELL_HEIGHT);
+                }
+            }
+
+            function drawRulers(highlightCol = null, highlightRow = null) {
+                drawTopRuler(highlightCol);
+                drawLeftRuler(highlightRow);
+            }
+
+            function showRulers(show) {
+                if (show) {
+                    topRuler.classList.remove('hidden');
+                    leftRuler.classList.remove('hidden');
+                    cornerBox.classList.remove('hidden');
+                    drawRulers();
+                } else {
+                    topRuler.classList.add('hidden');
+                    leftRuler.classList.add('hidden');
+                    cornerBox.classList.add('hidden');
+                }
+            }
+
             function getMousePos(event) {
                 const rect = canvas.getBoundingClientRect();
                 return {
                     x: event.clientX - rect.left,
                     y: event.clientY - rect.top
                 };
+            }
+
+            function updateCoordsUI(col, row) {
+                if (!guideEnabled) return; // 只在辅助线开启时显示
+                cornerBox.textContent = `${col + 1},${row + 1}`;
+                drawRulers(col, row);
             }
 
             function redrawCell(col, row) {
@@ -630,6 +806,7 @@
                 if (mode === 'erase') drawOverlayEraseHighlight(col, row);
 
                 lastCell = current;
+                updateCoordsUI(col, row);
             }
 
             function clearCanvas() {
@@ -729,6 +906,7 @@
                     // 先画十字，再画选中边框，避免被清除
                     drawOverlayCrosshair(col, row);
                     if (selectedCell) drawOverlaySelection(selectedCell.col, selectedCell.row);
+                    updateCoordsUI(col, row);
                     return;
                 }
                 if (isDrawing) {
@@ -744,6 +922,7 @@
                     }
                     drawOverlayCrosshair(col, row);
                     if (mode === 'erase') drawOverlayEraseHighlight(col, row);
+                    updateCoordsUI(col, row);
                 }
             });
             canvas.addEventListener('mouseup', () => {
@@ -758,6 +937,7 @@
                 lastCell = null;
                 lineLock = null;
                 if (!guideEnabled) octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                if (guideEnabled) drawRulers();
             });
             clearButton.addEventListener('click', clearCanvas);
             copyButton.addEventListener('click', copyGridToClipboard);
@@ -780,6 +960,7 @@
                 guideButton.textContent = `辅助线：${guideEnabled ? '开' : '关'}`;
                 guideButton.classList.toggle('active', guideEnabled);
                 octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                showRulers(guideEnabled);
             });
 
             diagonalGuideButton.addEventListener('click', () => {
@@ -829,6 +1010,8 @@
             // 预计算所有候选字符的边掩码（基于当前字体/像素）
             precomputeCharMasks();
             octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            setupRulers();
+            showRulers(false);
 
             // 将默认文本播种到画布
             function seedDefaultPattern() {
